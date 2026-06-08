@@ -185,8 +185,8 @@ def main() -> None:
 
     config_path = _build_config(args.gpu_memory_utilization, codec_cuda_graph=args.codec_cuda_graph)
     codec_mode = "cuda-graph" if args.codec_cuda_graph else "eager"
-    print(f"Loading Omni (config={config_path}, codec={codec_mode}) …")
-    omni = Omni(config_path, stage_init_timeout=300)
+    print(f"Loading Omni (model={_MODEL}, config={config_path}, codec={codec_mode}) …")
+    omni = Omni(model=_MODEL, stage_configs_path=config_path, stage_init_timeout=300)
     device = torch.device("cuda")
     print(f"Device: {torch.cuda.get_device_name(device)}\n")
 

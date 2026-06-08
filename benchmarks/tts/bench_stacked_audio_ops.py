@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Micro-benchmark: MOSS-TTS talker stacked audio ops vs per-head loop.
+"""E2E benchmark: MOSS-TTS talker throughput (stacked audio ops, PR #4230).
 
-Measures per-step latency of the two hot paths replaced by PR #4230:
+Loads MOSS-VoiceGenerator via Omni offline inference and measures Stage-0
+talker token throughput and RTF.  Run on feat/moss-tts-stacked-audio-ops vs
+main to produce before/after numbers.
 
-  1. audio_head  — n_vq serial nn.Linear calls  vs  stacked_w @ h (batched matmul)
-  2. audio_embed — n_vq serial Embedding lookups vs  stacked_emb[arange, codes].sum(0)
-
-No model checkpoint is required; weights are randomly initialised.
+Requires the model to be cached locally (or network access to HuggingFace).
 
 Usage::
 
+    # default: 2 warmup + 8 timed requests, max_tokens=256
+    python benchmarks/tts/bench_stacked_audio_ops.py
+
+    # custom
     python benchmarks/tts/bench_stacked_audio_ops.py \\
-        [--n-vq 16 32] \\
-        [--hidden 2048] \\
-        [--vocab 4096] \\
-        [--num-runs 500]
+        --num-requests 10 \\
+        --max-tokens 512 \\
+        --warmup 2 \\
+        --gpu-memory-utilization 0.70
 
 Output is printed as a Markdown table suitable for pasting into a PR description.
 """
@@ -24,77 +27,212 @@ Output is printed as a Markdown table suitable for pasting into a PR description
 from __future__ import annotations
 
 import argparse
+import gc
+import os
+import statistics
 import time
+from pathlib import Path
 
 import torch
+from vllm import SamplingParams
+
+from vllm_omni import Omni
+
+_MODEL = "OpenMOSS-Team/MOSS-VoiceGenerator"
+_SAMPLE_RATE = 24_000
+_DEPLOY_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "deploy"
+
+_PROMPTS = [
+    ("Hello, this is a MOSS voice design benchmark.", "a warm female voice with an American accent"),
+    ("今天天气真不错，适合出去走走。", "清晰温暖的女声"),
+    ("The quick brown fox jumps over the lazy dog.", "a young male voice with a British accent"),
+    ("人工智能正在改变我们的生活方式。", "沉稳男声"),
+    ("Benchmarking neural text-to-speech synthesis.", "a neutral professional voice"),
+    ("语音合成技术在近年来取得了显著进步。", "明亮活泼的女声"),
+    ("This benchmark measures end-to-end generation throughput.", "a deep calm male voice"),
+    ("开始测试批量语音合成的性能指标。", "标准普通话女声"),
+    ("Real-time factor measures how fast we generate audio.", "a warm friendly voice"),
+    ("批量推理能够显著提升系统吞吐量。", "年轻男声"),
+]
 
 
-def _sync(device: torch.device) -> None:
-    torch.accelerator.synchronize(device)
+def _build_request(text: str, instruction: str) -> dict:
+    from transformers import AutoProcessor
+
+    try:
+        proc = AutoProcessor.from_pretrained(_MODEL, trust_remote_code=True)
+    except Exception as exc:
+        if os.environ.get("MOSS_TTS_SKIP_ON_NET_FAIL"):
+            raise SystemExit(f"Cannot load AutoProcessor: {exc}") from exc
+        raise
+
+    user_msg = proc.build_user_message(text=text, instruction=instruction)
+    batch = proc(conversations=[[user_msg]], mode="generation")
+    unified = batch["input_ids"][0]
+    text_ids = unified[:, 0].tolist()
+    audio_codes = unified[:, 1:].contiguous().to(torch.int64)
+    del proc
+    gc.collect()
+
+    return {
+        "prompt_token_ids": text_ids,
+        "additional_information": {"codes": {"ref": audio_codes}},
+    }
 
 
-def _bench(fn, n: int, device: torch.device) -> float:
-    """Return mean latency in ms over n runs (excludes first warm-up call)."""
-    fn()
-    _sync(device)
-    t0 = time.perf_counter()
-    for _ in range(n):
-        fn()
-    _sync(device)
-    return (time.perf_counter() - t0) / n * 1000.0
+def _run_one(omni: Omni, request: dict, sampling: list[SamplingParams]) -> dict:
+    """Run one request; return timing and output stats."""
+    stage0_tokens = 0
+    audio_samples = 0
+    t_start = time.perf_counter()
+    t_stage0_end = t_start
+
+    for out in omni.generate(request, sampling):
+        t_now = time.perf_counter()
+        if out.stage_id == 0 and out.request_output is not None:
+            for comp in getattr(out.request_output, "outputs", []):
+                stage0_tokens += len(getattr(comp, "token_ids", []))
+            t_stage0_end = t_now
+        mm = out.multimodal_output
+        if mm:
+            audio = mm.get("audio") or mm.get("model_outputs")
+            if isinstance(audio, list):
+                audio = torch.cat(
+                    [t.reshape(-1) for t in audio if isinstance(t, torch.Tensor) and t.numel() > 0],
+                    dim=0,
+                )
+            if isinstance(audio, torch.Tensor):
+                audio_samples += int(audio.numel())
+
+    t_total = time.perf_counter() - t_start
+    t_stage0 = t_stage0_end - t_start
+
+    return {
+        "total_s": t_total,
+        "stage0_s": t_stage0,
+        "stage0_tokens": stage0_tokens,
+        "audio_samples": audio_samples,
+    }
+
+
+def _build_config(gpu_memory_utilization: float) -> str:
+    """Build a benchmark-friendly deploy config from moss_voice_generator.yaml."""
+    import tempfile
+
+    import yaml
+
+    yaml_path = _DEPLOY_DIR / "moss_voice_generator.yaml"
+    with open(yaml_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    for stage in cfg.get("stages", []):
+        if stage.get("stage_id") == 0:
+            stage["gpu_memory_utilization"] = gpu_memory_utilization
+            stage["max_num_seqs"] = 1
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8")
+    yaml.dump(cfg, tmp)
+    tmp.flush()
+    return tmp.name
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Bench MOSS-TTS stacked audio ops vs loop")
-    parser.add_argument("--n-vq", type=int, nargs="+", default=[16, 32])
-    parser.add_argument("--hidden", type=int, default=2048)
-    parser.add_argument("--vocab", type=int, default=4096)
-    parser.add_argument("--num-runs", type=int, default=500)
+    parser = argparse.ArgumentParser(description="E2E bench: MOSS-TTS stacked audio ops")
+    parser.add_argument("--num-requests", type=int, default=8, help="Number of timed requests")
+    parser.add_argument("--warmup", type=int, default=2, help="Warm-up requests (untimed)")
+    parser.add_argument("--max-tokens", type=int, default=256, help="Stage 0 max_tokens")
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.70,
+        help="Stage 0 gpu_memory_utilization",
+    )
     args = parser.parse_args()
 
+    sampling = [
+        SamplingParams(
+            temperature=1.7,
+            top_p=0.8,
+            top_k=25,
+            max_tokens=args.max_tokens,
+            seed=42,
+            detokenize=False,
+        ),
+        SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            max_tokens=65536,
+            seed=42,
+            detokenize=False,
+        ),
+    ]
+
+    print(f"Building requests (model={_MODEL}) …")
+    n_prompts = args.warmup + args.num_requests
+    requests = []
+    for i in range(n_prompts):
+        text, instr = _PROMPTS[i % len(_PROMPTS)]
+        requests.append(_build_request(text, instr))
+
+    config_path = _build_config(args.gpu_memory_utilization)
+    print(f"Loading Omni (config={config_path}) …")
+    omni = Omni(config_path, stage_init_timeout=300)
     device = torch.device("cuda")
-    N: int = args.num_runs
-    H: int = args.hidden
-    V: int = args.vocab + 1  # +1 for pad sentinel
+    print(f"Device: {torch.cuda.get_device_name(device)}\n")
 
-    print(f"Device: {torch.cuda.get_device_name(device)}  hidden={H}  vocab={V - 1}  n_runs={N}\n")
+    print(f"Warming up ({args.warmup} requests) …")
+    for i in range(args.warmup):
+        _run_one(omni, requests[i], sampling)
 
-    head_rows: list[tuple] = []
-    emb_rows: list[tuple] = []
+    print(f"Timing {args.num_requests} requests (max_tokens={args.max_tokens}) …\n")
+    results = []
+    for i in range(args.num_requests):
+        r = _run_one(omni, requests[args.warmup + i], sampling)
+        results.append(r)
+        audio_s = r["audio_samples"] / _SAMPLE_RATE
+        rtf = audio_s / r["total_s"] if r["total_s"] > 0 else 0.0
+        tok_s = r["stage0_tokens"] / r["stage0_s"] if r["stage0_s"] > 0 else 0.0
+        print(
+            f"  req {i + 1:2d}: total={r['total_s'] * 1000:.0f}ms  "
+            f"stage0={r['stage0_s'] * 1000:.0f}ms  "
+            f"tokens={r['stage0_tokens']}  "
+            f"audio={audio_s:.1f}s  "
+            f"RTF={rtf:.2f}  "
+            f"tok/s={tok_s:.1f}"
+        )
 
-    for n_vq in args.n_vq:
-        h = torch.randn(H, device=device)
-        codes = torch.randint(0, V - 1, (n_vq,), device=device)
-        idx = torch.arange(n_vq, device=device)
+    total_s_list = [r["total_s"] for r in results]
+    stage0_s_list = [r["stage0_s"] for r in results]
+    tok_s_list = [r["stage0_tokens"] / r["stage0_s"] for r in results if r["stage0_s"] > 0]
+    audio_s_list = [r["audio_samples"] / _SAMPLE_RATE for r in results]
+    rtf_list = [a / t for a, t in zip(audio_s_list, total_s_list) if t > 0]
 
-        # --- audio head ---
-        heads = [torch.nn.Linear(H, V, bias=False).to(device) for _ in range(n_vq)]
-        stacked_head = torch.stack([lin.weight.detach() for lin in heads])
+    print("\n### MOSS-TTS Stacked Audio Ops — E2E Benchmark\n")
+    print(
+        f"GPU: {torch.cuda.get_device_name(device)}  "
+        f"model: {_MODEL}  "
+        f"max_tokens: {args.max_tokens}  "
+        f"n_requests: {args.num_requests}\n"
+    )
+    print("| Metric | Mean | Median | P99 |")
+    print("|--------|------|--------|-----|")
 
-        head_loop_ms = _bench(lambda: [heads[i](h) for i in range(n_vq)], N, device)
-        head_stack_ms = _bench(lambda: stacked_head @ h, N, device)
-        head_rows.append((n_vq, head_loop_ms, head_stack_ms))
+    def _row(label: str, values: list[float], fmt: str = ".1f") -> str:
+        if not values:
+            return f"| {label} | n/a | n/a | n/a |"
+        mean = statistics.mean(values)
+        med = statistics.median(values)
+        p99 = sorted(values)[int(len(values) * 0.99)]
+        return f"| {label} | {mean:{fmt}} | {med:{fmt}} | {p99:{fmt}} |"
 
-        # --- audio embed ---
-        embs = [torch.nn.Embedding(V, H).to(device) for _ in range(n_vq)]
-        stacked_emb = torch.stack([e.weight.detach() for e in embs])
+    print(_row("Total latency (ms)", [v * 1000 for v in total_s_list]))
+    print(_row("Stage-0 latency (ms)", [v * 1000 for v in stage0_s_list]))
+    print(_row("Stage-0 tokens/sec", tok_s_list))
+    print(_row("Audio duration (s)", audio_s_list))
+    print(_row("RTF (audio/wall-clock)", rtf_list, ".3f"))
 
-        emb_loop_ms = _bench(lambda: sum(embs[i](codes[i : i + 1]) for i in range(n_vq)), N, device)
-        emb_stack_ms = _bench(lambda: stacked_emb[idx, codes].sum(0), N, device)
-        emb_rows.append((n_vq, emb_loop_ms, emb_stack_ms))
-
-    print("**audio_head** (batched matmul vs per-head nn.Linear loop)")
-    print("| n_vq | loop (ms) | stacked (ms) | speedup |")
-    print("|------|----------|-------------|---------|")
-    for n_vq, loop_ms, stack_ms in head_rows:
-        print(f"| {n_vq} | {loop_ms:.3f} | {stack_ms:.3f} | {loop_ms / stack_ms:.2f}x |")
-
-    print()
-    print("**audio_embed** (batched gather vs per-head Embedding loop)")
-    print("| n_vq | loop (ms) | stacked (ms) | speedup |")
-    print("|------|----------|-------------|---------|")
-    for n_vq, loop_ms, stack_ms in emb_rows:
-        print(f"| {n_vq} | {loop_ms:.3f} | {stack_ms:.3f} | {loop_ms / stack_ms:.2f}x |")
+    omni.close()
 
 
 if __name__ == "__main__":

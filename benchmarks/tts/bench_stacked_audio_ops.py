@@ -81,18 +81,11 @@ def _build_request(text: str, instruction: str) -> dict:
 
 
 def _run_one(omni: Omni, request: dict, sampling: list[SamplingParams]) -> dict:
-    """Run one request; return timing and output stats."""
-    stage0_tokens = 0
+    """Run one request; return wall-clock time and audio sample count."""
     audio_samples = 0
     t_start = time.perf_counter()
-    t_stage0_end = t_start
 
     for out in omni.generate(request, sampling):
-        t_now = time.perf_counter()
-        if out.stage_id == 0 and out.request_output is not None:
-            for comp in getattr(out.request_output, "outputs", []):
-                stage0_tokens += len(getattr(comp, "token_ids", []))
-            t_stage0_end = t_now
         mm = out.multimodal_output
         if mm:
             audio = mm.get("audio")
@@ -106,13 +99,8 @@ def _run_one(omni: Omni, request: dict, sampling: list[SamplingParams]) -> dict:
             if isinstance(audio, torch.Tensor):
                 audio_samples += int(audio.numel())
 
-    t_total = time.perf_counter() - t_start
-    t_stage0 = t_stage0_end - t_start
-
     return {
-        "total_s": t_total,
-        "stage0_s": t_stage0,
-        "stage0_tokens": stage0_tokens,
+        "total_s": time.perf_counter() - t_start,
         "audio_samples": audio_samples,
     }
 
@@ -203,19 +191,9 @@ def main() -> None:
         results.append(r)
         audio_s = r["audio_samples"] / _SAMPLE_RATE
         rtf = audio_s / r["total_s"] if r["total_s"] > 0 else 0.0
-        tok_s = r["stage0_tokens"] / r["stage0_s"] if r["stage0_s"] > 0 else 0.0
-        print(
-            f"  req {i + 1:2d}: total={r['total_s'] * 1000:.0f}ms  "
-            f"stage0={r['stage0_s'] * 1000:.0f}ms  "
-            f"tokens={r['stage0_tokens']}  "
-            f"audio={audio_s:.1f}s  "
-            f"RTF={rtf:.2f}  "
-            f"tok/s={tok_s:.1f}"
-        )
+        print(f"  req {i + 1:2d}: total={r['total_s'] * 1000:.0f}ms  audio={audio_s:.1f}s  RTF={rtf:.2f}")
 
     total_s_list = [r["total_s"] for r in results]
-    stage0_s_list = [r["stage0_s"] for r in results]
-    tok_s_list = [r["stage0_tokens"] / r["stage0_s"] for r in results if r["stage0_s"] > 0]
     audio_s_list = [r["audio_samples"] / _SAMPLE_RATE for r in results]
     rtf_list = [a / t for a, t in zip(audio_s_list, total_s_list) if t > 0]
 
@@ -239,8 +217,6 @@ def main() -> None:
         return f"| {label} | {mean:{fmt}} | {med:{fmt}} | {p99:{fmt}} |"
 
     print(_row("Total latency (ms)", [v * 1000 for v in total_s_list]))
-    print(_row("Stage-0 latency (ms)", [v * 1000 for v in stage0_s_list]))
-    print(_row("Stage-0 tokens/sec", tok_s_list))
     print(_row("Audio duration (s)", audio_s_list))
     print(_row("RTF (audio/wall-clock)", rtf_list, ".3f"))
 

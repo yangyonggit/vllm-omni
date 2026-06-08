@@ -95,7 +95,9 @@ def _run_one(omni: Omni, request: dict, sampling: list[SamplingParams]) -> dict:
             t_stage0_end = t_now
         mm = out.multimodal_output
         if mm:
-            audio = mm.get("audio") or mm.get("model_outputs")
+            audio = mm.get("audio")
+            if audio is None:
+                audio = mm.get("model_outputs")
             if isinstance(audio, list):
                 audio = torch.cat(
                     [t.reshape(-1) for t in audio if isinstance(t, torch.Tensor) and t.numel() > 0],

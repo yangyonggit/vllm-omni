@@ -115,7 +115,7 @@ def _run_one(omni: Omni, request: dict, sampling: list[SamplingParams]) -> dict:
     }
 
 
-def _build_config(gpu_memory_utilization: float) -> str:
+def _build_config(gpu_memory_utilization: float, codec_cuda_graph: bool = False) -> str:
     """Build a benchmark-friendly deploy config from moss_voice_generator.yaml."""
     import tempfile
 
@@ -126,9 +126,12 @@ def _build_config(gpu_memory_utilization: float) -> str:
         cfg = yaml.safe_load(f) or {}
 
     for stage in cfg.get("stages", []):
-        if stage.get("stage_id") == 0:
+        sid = stage.get("stage_id")
+        if sid == 0:
             stage["gpu_memory_utilization"] = gpu_memory_utilization
             stage["max_num_seqs"] = 1
+        elif sid == 1 and codec_cuda_graph:
+            stage["enforce_eager"] = False
 
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8")
     yaml.dump(cfg, tmp)
@@ -146,6 +149,11 @@ def main() -> None:
         type=float,
         default=0.70,
         help="Stage 0 gpu_memory_utilization",
+    )
+    parser.add_argument(
+        "--codec-cuda-graph",
+        action="store_true",
+        help="Enable CUDA Graph for Stage-1 codec (sets enforce_eager=False)",
     )
     args = parser.parse_args()
 
@@ -175,8 +183,9 @@ def main() -> None:
         text, instr = _PROMPTS[i % len(_PROMPTS)]
         requests.append(_build_request(text, instr))
 
-    config_path = _build_config(args.gpu_memory_utilization)
-    print(f"Loading Omni (config={config_path}) …")
+    config_path = _build_config(args.gpu_memory_utilization, codec_cuda_graph=args.codec_cuda_graph)
+    codec_mode = "cuda-graph" if args.codec_cuda_graph else "eager"
+    print(f"Loading Omni (config={config_path}, codec={codec_mode}) …")
     omni = Omni(config_path, stage_init_timeout=300)
     device = torch.device("cuda")
     print(f"Device: {torch.cuda.get_device_name(device)}\n")
@@ -213,7 +222,8 @@ def main() -> None:
         f"GPU: {torch.cuda.get_device_name(device)}  "
         f"model: {_MODEL}  "
         f"max_tokens: {args.max_tokens}  "
-        f"n_requests: {args.num_requests}\n"
+        f"n_requests: {args.num_requests}  "
+        f"codec: {codec_mode}\n"
     )
     print("| Metric | Mean | Median | P99 |")
     print("|--------|------|--------|-----|")
